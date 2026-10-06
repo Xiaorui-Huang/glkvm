@@ -1,10 +1,14 @@
 (function(root) {
 	"use strict";
 	if (root.kvmKeyboardCapture) {
-		throw new Error("Keyboard capture already installed in this page");
+		if (JSON.parse(root.kvmKeyboardCapture.json()).active) {
+			throw new Error("Stop the current capture before updating the recorder");
+		}
+		root.kvmKeyboardCapturePrevious = root.kvmKeyboardCapture;
 	}
 	let active = false;
 	let timer = null;
+	let durationSeconds = 300;
 	let started = null;
 	let stopped = null;
 	let reason = null;
@@ -17,8 +21,8 @@
 		if (!active) {
 			return;
 		}
-		records.push({kind, time: root.performance.now(), epoch: Date.now(), ...details});
-		if (records.length >= 4096) {
+		records.push({sequence: records.length + 1, kind, time: root.performance.now(), epoch: Date.now(), ...details});
+		if (records.length >= 50000) {
 			stop("record-limit");
 		}
 	}
@@ -103,7 +107,8 @@
 	}
 
 	function keyEvent(event) {
-		record(event.type, {code: event.code, repeat: event.repeat, trusted: event.isTrusted,
+		record(event.type, {code: event.code, key: event.key, location: event.location,
+			composing: event.isComposing, repeat: event.repeat, trusted: event.isTrusted,
 			shift: event.shiftKey, ctrl: event.ctrlKey, alt: event.altKey, meta: event.metaKey,
 			eventTime: event.timeStamp});
 	}
@@ -119,7 +124,7 @@
 		active = false;
 		root.clearTimeout(timer);
 		for (const type of ["keydown", "keyup"]) {
-			root.addEventListener && root.removeEventListener(type, keyEvent, true);
+			root.removeEventListener(type, keyEvent, true);
 		}
 		for (const type of ["blur", "focus"]) {
 			root.removeEventListener(type, focusEvent, true);
@@ -137,10 +142,14 @@
 		return records.length;
 	}
 
-	function start() {
+	function start(seconds = 300) {
 		if (active) {
 			throw new Error("Capture is already running");
 		}
+		if (!Number.isInteger(seconds) || seconds < 1 || seconds > 600) {
+			throw new Error("Capture duration must be an integer from 1 to 600 seconds");
+		}
+		durationSeconds = seconds;
 		records = [];
 		connections = new WeakMap();
 		nextConnection = 1;
@@ -158,20 +167,44 @@
 				root.addEventListener(type, focusEvent, true);
 			}
 			root.document.addEventListener("visibilitychange", focusEvent, true);
-			timer = root.setTimeout(() => stop("90-second-limit"), 90000);
+			timer = root.setTimeout(() => stop("duration-limit"), seconds * 1000);
 		} catch (error) {
 			stop("setup-error");
 			throw error;
 		}
-		root.console.info("Keyboard capture running for at most 90 seconds. Use only the agreed test text.");
+		root.console.info("Keyboard capture running for", seconds, "seconds. Type freely in the KVM tab; do not type secrets.");
 		return started;
 	}
 
 	function json() {
-		return JSON.stringify({version: 1, active, started, stopped, reason,
+		return JSON.stringify({version: 2, active, started, stopped, reason, durationSeconds,
 			timeOrigin: root.performance.timeOrigin, records}, null, 2);
 	}
 
-	root.kvmKeyboardCapture = {start, stop, json};
+	function status() {
+		const counts = {};
+		for (const entry of records) {
+			counts[entry.kind] = (counts[entry.kind] || 0) + 1;
+		}
+		return {active, started, stopped, reason, durationSeconds, counts,
+			webrtcSendsObserved: records.some(entry => entry.kind === "send-call" && entry.transport === "webrtc")};
+	}
+
+	function download() {
+		if (active) {
+			throw new Error("Stop recording before exporting");
+		}
+		const url = root.URL.createObjectURL(new root.Blob([json()], {type: "application/json"}));
+		const anchor = root.document.createElement("a");
+		anchor.href = url;
+		anchor.download = "keyboard-browser-" + (started || Date.now()) + ".json";
+		try {
+			anchor.click();
+		} finally {
+			root.setTimeout(() => root.URL.revokeObjectURL(url), 1000);
+		}
+	}
+
+	root.kvmKeyboardCapture = {start, stop, json, status, download};
 	root.console.info("Keyboard capture prepared, not recording. Start with kvmKeyboardCapture.start().");
 })(globalThis);

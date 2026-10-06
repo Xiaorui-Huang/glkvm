@@ -1,3 +1,4 @@
+import argparse
 import json
 import signal
 import subprocess
@@ -42,3 +43,18 @@ def test_capture_kills_only_unresponsive_tracer(tmp_path: Path, monkeypatch: pyt
     capture.record(tmp_path)
     tracer.send_signal.assert_called_once_with(signal.SIGINT)
     tracer.kill.assert_called_once_with()
+
+
+def test_capture_uses_configured_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "metadata.json").write_text(json.dumps({"worker_pid": 1234, "descriptors": [5, 22], "duration_seconds": 360}))
+    tracer = Mock(pid=5678, returncode=0)
+    monkeypatch.setattr(capture.subprocess, "Popen", Mock(return_value=tracer))
+    monkeypatch.setattr(capture.signal, "signal", Mock())
+    capture.record(tmp_path)
+    tracer.communicate.assert_called_once_with(timeout=360)
+
+
+@pytest.mark.parametrize("value", ["0", "601", "1.5", "invalid"])
+def test_capture_duration_is_bounded(value: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        capture.duration_seconds(value)

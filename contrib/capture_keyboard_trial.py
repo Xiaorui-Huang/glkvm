@@ -11,6 +11,16 @@ from pathlib import Path
 ROOT = Path("/userdata/glkvm-trials/keyboard-638c3a0c")
 
 
+def duration_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Duration must be an integer") from error
+    if not 1 <= seconds <= 600:
+        raise argparse.ArgumentTypeError("Duration must be from 1 to 600 seconds")
+    return seconds
+
+
 def find_worker() -> tuple[int, list[int]]:
     workers = []
     for process in Path("/proc").iterdir():
@@ -62,7 +72,7 @@ def record(directory: Path) -> None:
         signal.signal(signal.SIGTERM, interrupt)
         signal.signal(signal.SIGINT, interrupt)
         try:
-            process.communicate(timeout=90)
+            process.communicate(timeout=metadata.get("duration_seconds", 90))
         except subprocess.TimeoutExpired:
             process.send_signal(signal.SIGINT)
             try:
@@ -80,13 +90,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("start", "run", "status", "stop"))
     parser.add_argument("--directory", type=Path)
+    parser.add_argument("--seconds", type=duration_seconds, default=360)
     args = parser.parse_args()
     os.umask(0o077)
     if args.action == "start":
         worker, descriptors = find_worker()
         directory = ROOT / time.strftime("capture-%Y%m%dT%H%M%SZ", time.gmtime())
         directory.mkdir(mode=0o700)
-        metadata = {"worker_pid": worker, "descriptors": descriptors, "duration_seconds": 90}
+        metadata = {"worker_pid": worker, "descriptors": descriptors, "duration_seconds": args.seconds}
         (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         with (directory / "supervisor.log").open("xb") as output:
             supervisor = subprocess.Popen(

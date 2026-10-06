@@ -17,6 +17,7 @@ function prepare() {
 	}
 	const original = Channel.prototype.send;
 	let timeout;
+	let timeoutMilliseconds;
 	const context = vm.createContext({
 		RTCDataChannel: Channel, console: {info() {}},
 		ArrayBuffer, Uint8Array,
@@ -24,10 +25,10 @@ function prepare() {
 		document: {visibilityState: "visible", addEventListener() {}, removeEventListener() {}},
 		addEventListener(type, handler) { listeners.set(type, handler); },
 		removeEventListener(type) { listeners.delete(type); },
-		setTimeout(handler) { timeout = handler; return 1; }, clearTimeout() {},
+		setTimeout(handler, milliseconds) { timeout = handler; timeoutMilliseconds = milliseconds; return 1; }, clearTimeout() {},
 	});
 	vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../contrib/capture-keyboard-browser.js"), "utf8"), context);
-	return {context, Channel, original, listeners, expire: () => timeout()};
+	return {context, Channel, original, listeners, expire: () => timeout(), timeoutMilliseconds: () => timeoutMilliseconds};
 }
 
 test("prepared script does not record until started and restores sends", () => {
@@ -47,7 +48,7 @@ test("prepared script does not record until started and restores sends", () => {
 	expire();
 	assert.equal(Channel.prototype.send, original);
 	assert.equal(listeners.size, 0);
-	assert.equal(JSON.parse(context.kvmKeyboardCapture.json()).reason, "90-second-limit");
+	assert.equal(JSON.parse(context.kvmKeyboardCapture.json()).reason, "duration-limit");
 });
 
 test("preserves original send exceptions without logging unrelated strings", () => {
@@ -72,4 +73,78 @@ test("capture failure cannot suppress the application's send", () => {
 	assert.equal(channel.send("test"), "original-result");
 	assert.equal(channel.last, "test");
 	context.kvmKeyboardCapture.stop();
+});
+
+test("arbitrary keys retain order, repeat and modifier information", () => {
+	const {context, listeners, expire, timeoutMilliseconds} = prepare();
+	context.kvmKeyboardCapture.start(300);
+	assert.equal(timeoutMilliseconds(), 300000);
+	const input = [
+		{type: "keydown", code: "KeyZ", key: "Z", shiftKey: true},
+		{type: "keydown", code: "KeyA", key: "A", shiftKey: true},
+		{type: "keyup", code: "KeyZ", key: "Z", shiftKey: true},
+		{type: "keydown", code: "KeyA", key: "A", shiftKey: true, repeat: true},
+		{type: "keyup", code: "KeyA", key: "A", shiftKey: true},
+	];
+	for (const event of input) {
+		listeners.get(event.type)(event);
+	}
+	const captured = JSON.parse(context.kvmKeyboardCapture.json());
+	assert.deepEqual(captured.records.map(entry => entry.code), input.map(entry => entry.code));
+	assert.deepEqual(captured.records.map(entry => entry.sequence), [1, 2, 3, 4, 5]);
+	assert.equal(captured.records[3].repeat, true);
+	assert.equal(captured.records[0].key, "Z");
+	assert.equal(captured.durationSeconds, 300);
+	assert.equal(context.kvmKeyboardCapture.status().counts.keydown, 3);
+	assert.equal(context.kvmKeyboardCapture.status().webrtcSendsObserved, false);
+	expire();
+	assert.equal(context.kvmKeyboardCapture.status().active, false);
+});
+
+test("invalid durations do not start recording", () => {
+	const {context, Channel, original} = prepare();
+	for (const duration of [0, 601, 1.5, "300"]) {
+		assert.throws(() => context.kvmKeyboardCapture.start(duration), /duration/);
+	}
+	assert.equal(Channel.prototype.send, original);
+	assert.equal(context.kvmKeyboardCapture.status().active, false);
+});
+
+test("updating an inactive recorder preserves its previous data", () => {
+	const {context, listeners} = prepare();
+	context.kvmKeyboardCapture.start();
+	listeners.get("keyup")({type: "keyup", code: "KeyZ"});
+	const script = fs.readFileSync(path.resolve(__dirname, "../../contrib/capture-keyboard-browser.js"), "utf8");
+	assert.throws(() => vm.runInContext(script, context), /Stop the current capture/);
+	context.kvmKeyboardCapture.stop();
+	vm.runInContext(script, context);
+	assert.equal(JSON.parse(context.kvmKeyboardCapturePrevious.json()).records[0].code, "KeyZ");
+	assert.equal(context.kvmKeyboardCapture.status().active, false);
+});
+
+test("download exports the complete stopped log and revokes its temporary URL", () => {
+	const {context, listeners, expire} = prepare();
+	let exported;
+	let clicked = false;
+	let revoked;
+	const anchor = {click() { clicked = true; }};
+	context.Blob = class {
+		constructor(parts) { this.parts = parts; }
+	};
+	context.URL = {
+		createObjectURL(blob) { exported = blob.parts[0]; return "blob:test"; },
+		revokeObjectURL(url) { revoked = url; },
+	};
+	context.document.createElement = () => anchor;
+	context.kvmKeyboardCapture.start(240);
+	assert.throws(() => context.kvmKeyboardCapture.download(), /Stop recording/);
+	listeners.get("keydown")({type: "keydown", code: "Backspace", key: "Backspace"});
+	context.kvmKeyboardCapture.stop();
+	context.kvmKeyboardCapture.download();
+	assert.equal(clicked, true);
+	assert.equal(anchor.href, "blob:test");
+	assert.match(anchor.download, /^keyboard-browser-\d+\.json$/);
+	assert.equal(JSON.parse(exported).records[0].code, "Backspace");
+	expire();
+	assert.equal(revoked, "blob:test");
 });
