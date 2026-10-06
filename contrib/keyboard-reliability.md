@@ -144,6 +144,58 @@ The local-upgrade UI expects a valid firmware image, not arbitrary source code.
 Do not flash firmware, bypass signatures, modify boot partitions, or reboot the
 device merely to try this Python fix.
 
+## Active Hardware Trial
+
+On 2026-10-06 the user authorized a targeted SSH trial of revision `638c3a0c`
+against a Windows 11 target with a physical keyboard available. This is a custom
+Python patch, not a firmware upgrade or a vendor-supported installer.
+
+The complete installed `device.pyc` and `keyboard.pyc` matched the protected
+baseline and the bytecode compiled from pre-patch revision `3e8dd23c`, ignoring
+only source filenames and line locations. The patched modules were compiled with
+the device's Python 3.12.5 and imported against its installed dependencies in a
+separate staging process. Pure report checks did not open USB devices.
+
+[The deployment tool](keyboard_trial.py) saved exact originals and a manifest,
+stopped KVMD, replaced only those two bytecode files, preserved their recorded
+ownership/modes/mtimes and directory metadata, then started KVMD. No source
+overrides or Python caches were installed. No configuration, firmware, or boot
+files were changed; there was no reboot or synthetic target input.
+
+The service script printed an immediate stop failure while the old daemon was
+exiting. The tool independently waited until all old KVMD/HID workers were gone
+before replacement. Post-install checks verified both patch hashes and metadata,
+one new main process and the expected keyboard/mouse/touch workers, a responsive
+daemon socket, and HTTP 200 from the LAN web interface. Video and target input
+remain manual acceptance checks, not established by these health checks.
+
+Private trial directory: `/userdata/glkvm-trials/keyboard-638c3a0c/`.
+Its originals, manifest, and rollback tool also have a protected off-device copy
+under the baseline backup's `trial-638c3a0c` directory. Seven filesystem tests
+verify exact install/rollback, fail-closed hash checks, and stop/copy/start failure
+handling without services or hardware. Actual running-service rollback has not
+yet been exercised; it is required after the user's first trial.
+
+Restore the original modules from the manager PC with:
+
+```powershell
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes root@glkvm /userdata/glkvm-trials/keyboard-638c3a0c/rollback.sh
+```
+
+[The rollback wrapper](rollback-keyboard-trial.sh) invokes the same tool over SSH,
+not through the web UI. It checks the private originals, stops KVMD and waits for
+its workers to exit, atomically restores both original bytecode files and recorded
+metadata, checks their hashes, then starts KVMD and checks daemon/worker readiness.
+Do not upgrade firmware or edit the affected package files while this trial is
+active. This command requires functioning SSH and device Python; it is not a
+recovery mechanism for firmware or storage damage.
+
+Use one LAN browser session and a disposable Notepad document on the target.
+Compare normal typing, long holds and release, Shift combinations, overlapping
+keys, and Backspace. Stop on unpredictable input and use the physical keyboard
+as needed. After testing, restore the original software even if typing succeeds,
+then verify web access, video, and keyboard behavior before retaining the patch.
+
 ## Remaining Work
 
 - Confirm the active frontend/Native WebRTC relay path and correlate LAN failures
