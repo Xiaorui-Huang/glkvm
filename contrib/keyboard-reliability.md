@@ -23,7 +23,13 @@ delivery: each report must succeed before the next report is processed. Temporar
 USB backpressure does not turn a normal press into an immediate-release tap.
 
 Clear/reset advances a shared generation. Queued events and pending retries from
-older generations are cancelled. If the configured write attempts are exhausted,
+older generations are cancelled. The final generation check and nonblocking USB
+write share the reset lock: a reset waits for an already-started write, and no
+old-generation write begins after the reset advances the generation. LED reads
+run outside that lock; their processing errors are logged without discarding
+pending keyboard transitions. Other HID devices retain their existing behavior.
+
+If the configured write attempts are exhausted,
 the worker clears its local key state, attempts an all-release report when USB
 permits, reports HID offline, and rejects ordinary events until clear/reset.
 Recovery must successfully write its clear report before later input proceeds.
@@ -34,15 +40,20 @@ also consume time. Existing retry settings still need validation on real hardwar
 ## Local Validation
 
 [The focused tests](../testenv/tests/plugins/hid/test_otg_keyboard.py) call the
-production keyboard worker directly in the test process. They mock device
-readiness, USB writes, timing, and event delivery; they do not start a hardware
-worker or send keys to the target.
+production keyboard worker directly in the test process for most cases. Two
+additional Linux fork cases exercise real worker processes, multiprocessing
+queues, and the shared generation lock with explicit read/write/reset handshakes.
+USB hardware remains mocked; no test sends keys to the target.
 
-The 17 cases cover healthy delivery, failed presses, EAGAIN/ESHUTDOWN, device
+The 24 cases cover healthy delivery, failed presses, EAGAIN/ESHUTDOWN, device
 readiness, held keys, overlapping keys and modifiers, multiple reports from a
 single event, retry exhaustion, explicit recovery, stop requests, reset
-cancellation, late old-generation events, and release after USB reconnect.
+cancellation, late old-generation events, release after USB reconnect, clear
+during LED reads, and transient or persistent LED processing errors.
 One case verifies all 100,000 discrete transitions with intermittent write failures.
+The two cross-process cases also passed 20 repetitions (40 cases total), without
+deadlocks or ordering failures observed. These are software checks, not hardware
+or end-to-end network acceptance.
 
 Run the focused suite in a Linux Python environment with KVMD test dependencies:
 
