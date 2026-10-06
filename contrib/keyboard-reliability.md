@@ -27,7 +27,16 @@ older generations are cancelled. The final generation check and nonblocking USB
 write share the reset lock: a reset waits for an already-started write, and no
 old-generation write begins after the reset advances the generation. LED reads
 run outside that lock; their processing errors are logged without discarding
-pending keyboard transitions. Other HID devices retain their existing behavior.
+pending keyboard transitions. Logging and state publication after the USB syscall
+also run outside that lock. A blocked reporting sink can still delay the worker,
+including all-release delivery, but cannot keep the parent's reset-generation
+update waiting for the write lock. Other HID devices retain their existing output
+policy.
+
+Each keyboard LED drain handles at most 64 reports, checks stop/reset between
+reads, and ends on read errors or EOF. A continuously readable endpoint cannot
+keep the worker inside one drain indefinitely. These are iteration bounds, not
+elapsed-time guarantees for logging, callbacks, or device operations.
 
 If the configured write attempts are exhausted,
 the worker clears its local key state, attempts an all-release report when USB
@@ -43,13 +52,17 @@ also consume time. Existing retry settings still need validation on real hardwar
 production keyboard worker directly in the test process for most cases. Two
 additional Linux fork cases exercise real worker processes, multiprocessing
 queues, and the shared generation lock with explicit read/write/reset handshakes.
+The write checkpoint pauses the raw USB syscall rather than the reporting helper.
 USB hardware remains mocked; no test sends keys to the target.
 
-The 24 cases cover healthy delivery, failed presses, EAGAIN/ESHUTDOWN, device
+The 38 cases cover healthy delivery, failed presses, EAGAIN/ESHUTDOWN, device
 readiness, held keys, overlapping keys and modifiers, multiple reports from a
 single event, retry exhaustion, explicit recovery, stop requests, reset
 cancellation, late old-generation events, release after USB reconnect, clear
 during LED reads, and transient or persistent LED processing errors.
+Low-level cases exercise the real LED reader with continuously ready input,
+read errors, EOF, stop/reset cancellation, and ordered press/release delivery.
+They also verify that blocked logging or state publication does not block reset.
 One case verifies all 100,000 discrete transitions with intermittent write failures.
 The two cross-process cases also passed 20 repetitions (40 cases total), without
 deadlocks or ordering failures observed. These are software checks, not hardware
