@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import multiprocessing
 import queue
+import threading
 from collections import deque
 from collections.abc import Iterable
 from typing import Any
@@ -30,9 +32,13 @@ def _run_keyboard(
     stop_after: int=0,
     clear_after: int=0,
     delayed_old_event: bool=False,
+    clear_on_read: int=0,
+    read_error_at: int=0,
 ) -> tuple[list[bytes], list[bytes], dict[str, Any]]:
+    notifier = aiomulti.AioProcessNotifier()
+    monkeypatch.setattr(notifier, "notify", lambda mask=0: None)
     process = KeyboardProcess(
-        notifier=aiomulti.AioProcessNotifier(),
+        notifier=notifier,
         device_path="/dev/test-keyboard",
         select_timeout=0.01,
         queue_timeout=0.01,
@@ -46,6 +52,7 @@ def _run_keyboard(
     attempts: list[bytes] = []
     stop = process._BaseDeviceProcess__stop_event
     idle_polls = 0
+    reads = 0
 
     def get_event(timeout: float) -> tuple[int, BaseEvent]:
         nonlocal idle_polls
@@ -94,13 +101,21 @@ def _run_keyboard(
         _ = timeout
         return stop.is_set()
 
+    def read_reports() -> None:
+        nonlocal reads
+        reads += 1
+        if reads == clear_on_read:
+            process.send_clear_event()
+        if reads == read_error_at or read_error_at == -1:
+            process._process_read_report(b"")
+
     event_queue = process._BaseDeviceProcess__events_queue
     monkeypatch.setattr(process, "_BaseDeviceProcess__events_queue", Mock(
         get=get_event, get_nowait=get_nowait, put_nowait=pending.append,
     ))
     monkeypatch.setattr(process, "_BaseDeviceProcess__fd", 123)
     monkeypatch.setattr(process, "_BaseDeviceProcess__ensure_device", ensure_device)
-    monkeypatch.setattr(process, "_BaseDeviceProcess__read_all_reports", lambda: None)
+    monkeypatch.setattr(process, "_BaseDeviceProcess__read_all_reports", read_reports)
     monkeypatch.setattr(process, "_BaseDeviceProcess__is_udc_configured", lambda: True)
     monkeypatch.setattr(device.os, "write", write_report)
     monkeypatch.setattr(stop, "wait", wait_for_stop)
@@ -111,6 +126,8 @@ def _run_keyboard(
     finally:
         event_queue.close()
         event_queue.join_thread()
+        notifier._AioProcessNotifier__queue.close()
+        notifier._AioProcessNotifier__queue.join_thread()
     return accepted, attempts, asyncio.run(process.get_state())
 
 
@@ -247,3 +264,114 @@ def test_100000_transitions_with_intermittent_write_failures(monkeypatch: pytest
     assert len(accepted) == 100000
     assert accepted == expected
     assert state["online"]
+
+
+def test_clear_during_led_read_cancels_pending_press(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = [make_keyboard_event(ecodes.KEY_A, True), make_keyboard_event(ecodes.KEY_A, False)]
+    accepted, attempts, state = _run_keyboard(monkeypatch, events, [], clear_on_read=2)
+    assert accepted == attempts == [_report(), _report()]
+    assert state["online"]
+
+
+@pytest.mark.parametrize("read_error_at", [1, 2, 3, -1])
+def test_led_errors_do_not_drop_key_transitions(monkeypatch: pytest.MonkeyPatch, read_error_at: int) -> None:
+    events = [make_keyboard_event(ecodes.KEY_A, True), make_keyboard_event(ecodes.KEY_A, False)]
+    accepted, attempts, state = _run_keyboard(monkeypatch, events, [], read_error_at=read_error_at)
+    assert accepted == attempts == [_report(4), _report()]
+    assert state["online"]
+
+
+def _run_child_keyboard(process: KeyboardProcess, checkpoint: Any, resume: Any, released: Any, reports: Any, pause_at: str) -> None:
+    reads = 0
+
+    def read_reports() -> None:
+        nonlocal reads
+        reads += 1
+        if pause_at == "read" and reads == 2:
+            checkpoint.set()
+            if not resume.wait(5):
+                raise RuntimeError("LED read checkpoint timed out")
+
+    def write_report(report: bytes) -> bool:
+        if pause_at == "write" and report == _report(4):
+            checkpoint.set()
+            if not resume.wait(5):
+                raise RuntimeError("Write checkpoint timed out")
+        reports.put((process._BaseDeviceProcess__reset_generation.value, report))
+        if report == _report():
+            released.set()
+        return True
+
+    with (
+        patch.object(process, "_BaseDeviceProcess__ensure_device", return_value=True),
+        patch.object(process, "_BaseDeviceProcess__read_all_reports", side_effect=read_reports),
+        patch.object(process, "_BaseDeviceProcess__write_report", side_effect=write_report),
+        patch.object(process, "_BaseDeviceProcess__close_device"),
+        patch.object(process, "_BaseDeviceProcess__is_udc_configured", return_value=True),
+        patch.object(device.aioproc, "settle", return_value=logging.getLogger("test-child-keyboard")),
+    ):
+        process.run()
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="Device uses Linux fork workers")
+@pytest.mark.parametrize("pause_at", ["read", "write"])
+def test_reset_is_serialized_across_processes(pause_at: str) -> None:
+    context = multiprocessing.get_context("fork")
+    notifier = aiomulti.AioProcessNotifier()
+    process = KeyboardProcess(
+        notifier=notifier, device_path="/dev/test-keyboard",
+        select_timeout=0.01, queue_timeout=0.01, write_retries=3, noop=False,
+    )
+    checkpoint = context.Event()
+    resume = context.Event()
+    released = context.Event()
+    resetting = context.Event()
+    reset_done = context.Event()
+    reports = context.Queue()
+    worker = context.Process(target=_run_child_keyboard, args=(process, checkpoint, resume, released, reports, pause_at))
+
+    def clear_keyboard() -> None:
+        resetting.set()
+        process.send_clear_event()
+        reset_done.set()
+
+    resetter = threading.Thread(target=clear_keyboard, daemon=True)
+    worker.start()
+    try:
+        process.send_key_event(ecodes.KEY_A, True)
+        assert checkpoint.wait(5), "Worker did not reach the synchronized checkpoint"
+        resetter.start()
+        assert resetting.wait(5)
+        if pause_at == "read":
+            assert reset_done.wait(5), "LED reads must not hold the reset/write lock"
+        else:
+            assert not reset_done.wait(0.1), "Reset completed while an old-generation write was in progress"
+        resume.set()
+        assert reset_done.wait(5)
+        assert released.wait(5), "Worker did not release the keyboard after reset"
+        if pause_at == "write":
+            assert reports.get(timeout=5) == (0, _report(4))
+        assert reports.get(timeout=5) == (1, _report())
+        if pause_at == "read":
+            assert reports.get(timeout=5) == (1, _report())
+        process.send_key_event(ecodes.KEY_B, True)
+        process.send_key_event(ecodes.KEY_B, False)
+        assert reports.get(timeout=5) == (1, _report(5))
+        assert reports.get(timeout=5) == (1, _report())
+    finally:
+        resume.set()
+        process._BaseDeviceProcess__stop_event.set()
+        worker.join(5)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(5)
+        if resetter.ident is not None:
+            resetter.join(5)
+        process._BaseDeviceProcess__events_queue.close()
+        process._BaseDeviceProcess__events_queue.join_thread()
+        reports.close()
+        reports.join_thread()
+        notifier._AioProcessNotifier__queue.close()
+        notifier._AioProcessNotifier__queue.join_thread()
+    assert worker.exitcode == 0
+    assert not resetter.is_alive()

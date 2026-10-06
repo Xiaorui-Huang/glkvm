@@ -101,7 +101,7 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
             try:
                 while not self.__stop_event.is_set():
                     if self.__ensure_device():
-                        self.__read_all_reports()
+                        self.__read_reports()
                         if suspended and release_report and self.__write_report(release_report):
                             release_report = b""
                     if suspended:
@@ -172,15 +172,25 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
             if self.__stop_event.is_set() or generation != self.__reset_generation.value:
                 return False
             if self.__ensure_device():
-                if self.__stop_event.is_set() or generation != self.__reset_generation.value:
-                    return False
-                self.__read_all_reports()
-                if self.__write_report(report):
-                    return True
+                self.__read_reports()
+                with self.__reset_generation.get_lock():
+                    if self.__stop_event.is_set() or generation != self.__reset_generation.value:
+                        return False
+                    if self.__write_report(report):
+                        return True
             if attempt < self.__write_retries:
                 if self.__stop_event.wait(min(self.__queue_timeout, 0.01)):
                     return False
         return False
+
+    def __read_reports(self) -> None:
+        if not self.__ensure_report_order:
+            self.__read_all_reports()
+            return
+        try:
+            self.__read_all_reports()
+        except Exception:
+            self.__get_logger().exception("Can't process input report from HID-%s", self.__name)
 
     async def get_state(self) -> dict:
         return (await self.__state_flags.get())
