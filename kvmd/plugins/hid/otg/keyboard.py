@@ -48,6 +48,7 @@ class KeyboardProcess(BaseDeviceProcess):
             name="keyboard",
             read_size=1,
             initial_state={"caps": False, "scroll": False, "num": False},
+            ensure_report_order=True,
             **kwargs,
         )
 

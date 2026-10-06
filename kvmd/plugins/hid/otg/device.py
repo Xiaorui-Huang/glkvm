@@ -29,6 +29,7 @@ import logging
 import time
 
 from typing import Generator
+from typing import cast
 
 from ....logging import get_logger
 
@@ -38,6 +39,8 @@ from .... import aioproc
 from .... import usb
 
 from .events import BaseEvent
+from .events import ClearEvent
+from .events import ResetEvent
 
 
 # =====
@@ -58,6 +61,7 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         queue_timeout: float,
         write_retries: int,
         noop: bool,
+        ensure_report_order: bool=False,
     ) -> None:
 
         super().__init__(daemon=True)
@@ -70,10 +74,12 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         self.__queue_timeout = queue_timeout
         self.__write_retries = write_retries
         self.__noop = noop
+        self.__ensure_report_order = ensure_report_order
 
         self.__udc_state_path = ""
         self.__fd = -1
-        self.__events_queue: "multiprocessing.Queue[BaseEvent]" = multiprocessing.Queue()
+        self.__events_queue: "multiprocessing.Queue[BaseEvent | tuple[int, BaseEvent]]" = multiprocessing.Queue()
+        self.__reset_generation = multiprocessing.Value("L", 0)
         self.__state_flags = aiomulti.AioSharedFlags({"online": True, **initial_state}, notifier)
         self.__stop_event = multiprocessing.Event()
         self.__no_device_reported = False
@@ -89,14 +95,21 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         self.__logger = aioproc.settle(f"HID-{self.__name}", f"hid-{self.__name}")
         report = b""
         retries = 0
+        suspended = False
+        release_report = b""
         while not self.__stop_event.is_set():
             try:
                 while not self.__stop_event.is_set():
                     if self.__ensure_device():
                         self.__read_all_reports()
+                        if suspended and release_report and self.__write_report(release_report):
+                            release_report = b""
+                    if suspended:
+                        self.__state_flags.update(online=False)
 
+                    generation = self.__reset_generation.value
                     try:
-                        event = self.__events_queue.get(timeout=self.__queue_timeout)
+                        queued = self.__events_queue.get(timeout=self.__queue_timeout)
                     except queue.Empty:
                         # Проблема в том, что устройство может отвечать EAGAIN или ESHUTDOWN,
                         # если оно было отключено физически. См:
@@ -107,8 +120,34 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
                         if not self.__is_udc_configured():
                             self.__state_flags.update(online=False)
                     else:
+                        if self.__ensure_report_order:
+                            (generation, event) = cast(tuple[int, BaseEvent], queued)
+                            if generation != self.__reset_generation.value:
+                                continue
+                        else:
+                            event = cast(BaseEvent, queued)
+                        if suspended:
+                            if not isinstance(event, (ClearEvent, ResetEvent)):
+                                continue
+                            suspended = False
+                            release_report = b""
                         # Посылка свежих репортов важнее старого
                         for report in self._process_event(event):
+                            if self.__ensure_report_order:
+                                if not self.__write_ordered_report(report, generation):
+                                    if self.__stop_event.is_set():
+                                        break
+                                    suspended = True
+                                    for release_report in self._process_event(ClearEvent()):
+                                        pass
+                                    self.__state_flags.update(online=False)
+                                    if generation == self.__reset_generation.value:
+                                        self.__logger.error(
+                                            "HID-%s report retries exhausted; input suspended until clear/reset",
+                                            self.__name,
+                                        )
+                                    break
+                                continue
                             retries = self.__write_retries
                             if self.__ensure_device():
                                 if self.__write_report(report):
@@ -127,6 +166,21 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
                 time.sleep(1)
 
         self.__close_device()
+
+    def __write_ordered_report(self, report: bytes, generation: int) -> bool:
+        for attempt in range(self.__write_retries + 1):
+            if self.__stop_event.is_set() or generation != self.__reset_generation.value:
+                return False
+            if self.__ensure_device():
+                if self.__stop_event.is_set() or generation != self.__reset_generation.value:
+                    return False
+                self.__read_all_reports()
+                if self.__write_report(report):
+                    return True
+            if attempt < self.__write_retries:
+                if self.__stop_event.wait(min(self.__queue_timeout, 0.01)):
+                    return False
+        return False
 
     async def get_state(self) -> dict:
         return (await self.__state_flags.get())
@@ -156,9 +210,15 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
             self.join()
 
     def _queue_event(self, event: BaseEvent) -> None:
-        self.__events_queue.put_nowait(event)
+        if self.__ensure_report_order:
+            self.__events_queue.put_nowait((self.__reset_generation.value, event))
+        else:
+            self.__events_queue.put_nowait(event)
 
     def _clear_queue(self) -> None:
+        if self.__ensure_report_order:
+            with self.__reset_generation.get_lock():
+                self.__reset_generation.value += 1
         tools.clear_queue(self.__events_queue)
 
     def _cleanup_write(self, report: bytes) -> None:
