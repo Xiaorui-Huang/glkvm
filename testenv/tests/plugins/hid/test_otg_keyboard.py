@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import logging
 import multiprocessing
 import queue
@@ -283,6 +284,7 @@ def test_led_errors_do_not_drop_key_transitions(monkeypatch: pytest.MonkeyPatch,
 
 def _run_child_keyboard(process: KeyboardProcess, checkpoint: Any, resume: Any, released: Any, reports: Any, pause_at: str) -> None:
     reads = 0
+    original_write = device.os.write
 
     def read_reports() -> None:
         nonlocal reads
@@ -292,7 +294,9 @@ def _run_child_keyboard(process: KeyboardProcess, checkpoint: Any, resume: Any, 
             if not resume.wait(5):
                 raise RuntimeError("LED read checkpoint timed out")
 
-    def write_report(report: bytes) -> bool:
+    def write_report(descriptor: int, report: bytes) -> int:
+        if descriptor != 123:
+            return original_write(descriptor, report)
         if pause_at == "write" and report == _report(4):
             checkpoint.set()
             if not resume.wait(5):
@@ -300,12 +304,13 @@ def _run_child_keyboard(process: KeyboardProcess, checkpoint: Any, resume: Any, 
         reports.put((process._BaseDeviceProcess__reset_generation.value, report))
         if report == _report():
             released.set()
-        return True
+        return len(report)
 
     with (
+        patch.object(process, "_BaseDeviceProcess__fd", 123),
         patch.object(process, "_BaseDeviceProcess__ensure_device", return_value=True),
         patch.object(process, "_BaseDeviceProcess__read_all_reports", side_effect=read_reports),
-        patch.object(process, "_BaseDeviceProcess__write_report", side_effect=write_report),
+        patch.object(device.os, "write", side_effect=write_report),
         patch.object(process, "_BaseDeviceProcess__close_device"),
         patch.object(process, "_BaseDeviceProcess__is_udc_configured", return_value=True),
         patch.object(device.aioproc, "settle", return_value=logging.getLogger("test-child-keyboard")),
@@ -375,3 +380,163 @@ def test_reset_is_serialized_across_processes(pause_at: str) -> None:
         notifier._AioProcessNotifier__queue.join_thread()
     assert worker.exitcode == 0
     assert not resetter.is_alive()
+
+
+class _DrainLimitExceeded(BaseException):
+    pass
+
+
+@pytest.fixture
+def low_level_keyboard(monkeypatch: pytest.MonkeyPatch) -> Iterable[KeyboardProcess]:
+    notifier = aiomulti.AioProcessNotifier()
+    monkeypatch.setattr(notifier, "notify", lambda mask=0: None)
+    process = KeyboardProcess(
+        notifier=notifier, device_path="/dev/test-keyboard",
+        select_timeout=0.01, queue_timeout=0.01, write_retries=3, noop=False,
+    )
+    monkeypatch.setattr(process, "_BaseDeviceProcess__fd", 123)
+    try:
+        yield process
+    finally:
+        process._BaseDeviceProcess__events_queue.close()
+        process._BaseDeviceProcess__events_queue.join_thread()
+        notifier._AioProcessNotifier__queue.close()
+        notifier._AioProcessNotifier__queue.join_thread()
+
+
+@pytest.mark.parametrize("error", [errno.EAGAIN, errno.ESHUTDOWN])
+def test_led_drain_stops_on_read_error(monkeypatch: pytest.MonkeyPatch, low_level_keyboard: KeyboardProcess, error: int) -> None:
+    reader = Mock(side_effect=[OSError(error, "USB unavailable"), _DrainLimitExceeded("Read repeated after failure")])
+    monkeypatch.setattr(device.select, "select", lambda *args: ([123], [], []))
+    monkeypatch.setattr(device.os, "read", reader)
+    low_level_keyboard._BaseDeviceProcess__read_reports()
+    assert reader.call_count == 1
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "clear", "limit", "eof"])
+def test_led_drain_is_bounded(monkeypatch: pytest.MonkeyPatch, low_level_keyboard: KeyboardProcess, interrupt: str) -> None:
+    reads = 0
+
+    def read_report(descriptor: int, size: int) -> bytes:
+        nonlocal reads
+        _ = (descriptor, size)
+        reads += 1
+        if reads > 64:
+            raise _DrainLimitExceeded("LED drain exceeded its batch limit")
+        if interrupt == "stop":
+            low_level_keyboard._BaseDeviceProcess__stop_event.set()
+        elif interrupt == "clear":
+            low_level_keyboard.send_clear_event()
+        return b"" if interrupt == "eof" else b"\x00"
+
+    monkeypatch.setattr(device.select, "select", lambda *args: ([123], [], []))
+    monkeypatch.setattr(device.os, "read", read_report)
+    low_level_keyboard._BaseDeviceProcess__read_reports()
+    assert reads == (64 if interrupt == "limit" else 1)
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "clear"])
+def test_led_drain_cancellation_prevents_stale_write(
+    monkeypatch: pytest.MonkeyPatch,
+    low_level_keyboard: KeyboardProcess,
+    interrupt: str,
+) -> None:
+    def read_report(descriptor: int, size: int) -> bytes:
+        _ = (descriptor, size)
+        if interrupt == "stop":
+            low_level_keyboard._BaseDeviceProcess__stop_event.set()
+        else:
+            low_level_keyboard.send_clear_event()
+        return b"\x00"
+
+    writer = Mock()
+    monkeypatch.setattr(low_level_keyboard, "_BaseDeviceProcess__ensure_device", lambda: True)
+    monkeypatch.setattr(device.select, "select", lambda *args: ([123], [], []))
+    monkeypatch.setattr(device.os, "read", read_report)
+    monkeypatch.setattr(device.os, "write", writer)
+    assert not low_level_keyboard._BaseDeviceProcess__write_ordered_report(_report(4), 0)
+    writer.assert_not_called()
+
+
+@pytest.mark.parametrize("read_result", [b"\x00", b"", errno.EAGAIN, errno.ESHUTDOWN])
+def test_real_led_drain_preserves_key_transitions(
+    monkeypatch: pytest.MonkeyPatch,
+    low_level_keyboard: KeyboardProcess,
+    read_result: bytes | int,
+) -> None:
+    reader = Mock()
+    if isinstance(read_result, int):
+        reader.side_effect = OSError(read_result, "USB unavailable")
+    else:
+        reader.return_value = read_result
+    accepted = []
+
+    def write_report(descriptor: int, report: bytes) -> int:
+        _ = descriptor
+        accepted.append(report)
+        return len(report)
+
+    monkeypatch.setattr(low_level_keyboard, "_BaseDeviceProcess__ensure_device", lambda: True)
+    monkeypatch.setattr(device.select, "select", lambda *args: ([123], [], []))
+    monkeypatch.setattr(device.os, "read", reader)
+    monkeypatch.setattr(device.os, "write", write_report)
+    assert low_level_keyboard._BaseDeviceProcess__write_ordered_report(_report(4), 0)
+    assert low_level_keyboard._BaseDeviceProcess__write_ordered_report(_report(), 0)
+    assert accepted == [_report(4), _report()]
+    assert reader.call_count == (128 if read_result == b"\x00" else 2)
+
+
+@pytest.mark.parametrize("blocked_at", ["logging", "status"])
+def test_reset_does_not_wait_for_write_reporting(
+    monkeypatch: pytest.MonkeyPatch,
+    low_level_keyboard: KeyboardProcess,
+    blocked_at: str,
+) -> None:
+    entered = threading.Event()
+    resume = threading.Event()
+    reset_done = threading.Event()
+    results = []
+    failures = []
+    logger = Mock()
+
+    def block_reporting(*args: Any, **kwargs: Any) -> None:
+        _ = (args, kwargs)
+        entered.set()
+        if not resume.wait(5):
+            raise RuntimeError("Reporting checkpoint timed out")
+
+    monkeypatch.setattr(low_level_keyboard, "_BaseDeviceProcess__logger", logger)
+    monkeypatch.setattr(low_level_keyboard, "_BaseDeviceProcess__ensure_device", lambda: True)
+    monkeypatch.setattr(low_level_keyboard, "_BaseDeviceProcess__read_all_reports", lambda: None)
+    monkeypatch.setattr(device.os, "write", lambda descriptor, report: 0 if blocked_at == "logging" else len(report))
+    if blocked_at == "logging":
+        logger.error.side_effect = block_reporting
+    else:
+        monkeypatch.setattr(low_level_keyboard._BaseDeviceProcess__state_flags, "update", block_reporting)
+
+    def write_report() -> None:
+        try:
+            results.append(low_level_keyboard._BaseDeviceProcess__write_ordered_report(_report(4), 0))
+        except Exception as error:
+            failures.append(error)
+
+    def clear_keyboard() -> None:
+        low_level_keyboard.send_clear_event()
+        reset_done.set()
+
+    writer = threading.Thread(target=write_report, daemon=True)
+    resetter = threading.Thread(target=clear_keyboard, daemon=True)
+    writer.start()
+    try:
+        assert entered.wait(5)
+        resetter.start()
+        assert reset_done.wait(1), "Reset was blocked by logging/status after the USB syscall"
+        assert writer.is_alive(), "Reporting must still be blocked at this checkpoint"
+    finally:
+        resume.set()
+        writer.join(5)
+        if resetter.ident is not None:
+            resetter.join(5)
+    assert not failures
+    assert not writer.is_alive() and not resetter.is_alive()
+    assert results == [blocked_at == "status"]

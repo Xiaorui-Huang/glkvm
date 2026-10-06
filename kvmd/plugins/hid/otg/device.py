@@ -173,11 +173,8 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
                 return False
             if self.__ensure_device():
                 self.__read_reports()
-                with self.__reset_generation.get_lock():
-                    if self.__stop_event.is_set() or generation != self.__reset_generation.value:
-                        return False
-                    if self.__write_report(report):
-                        return True
+                if self.__write_report(report, generation):
+                    return True
             if attempt < self.__write_retries:
                 if self.__stop_event.wait(min(self.__queue_timeout, 0.01)):
                     return False
@@ -265,7 +262,7 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
             # OSError (ENODEV etc.): UDC driver is resetting during gadget reconfiguration
             return False
 
-    def __write_report(self, report: bytes) -> bool:
+    def __write_report(self, report: bytes, generation: (int | None)=None) -> bool:
         assert report
 
         if self.__noop:
@@ -275,7 +272,13 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         logger = self.__get_logger()
 
         try:
-            written = os.write(self.__fd, report)
+            if generation is None:
+                written = os.write(self.__fd, report)
+            else:
+                with self.__reset_generation.get_lock():
+                    if self.__stop_event.is_set() or generation != self.__reset_generation.value:
+                        return False
+                    written = os.write(self.__fd, report)
             if written == len(report):
                 self.__state_flags.update(online=True)
                 return True
@@ -303,7 +306,11 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
         logger = self.__get_logger()
 
         read = True
-        while read:
+        generation = self.__reset_generation.value if self.__ensure_report_order else 0
+        reports = 0
+        while read and not self.__stop_event.is_set():
+            if self.__ensure_report_order and (reports >= 64 or generation != self.__reset_generation.value):
+                break
             try:
                 read = bool(select.select([self.__fd], [], [], 0)[0])
             except Exception as ex:
@@ -321,8 +328,12 @@ class BaseDeviceProcess(multiprocessing.Process):  # pylint: disable=too-many-in
                         logger.debug("HID-%s busy/unplugged (read): %s", self.__name, tools.efmt(ex))
                     else:
                         logger.exception("Can't read report from HID-%s", self.__name)
+                    break
                 else:
+                    if not report:
+                        break
                     self._process_read_report(report)
+                    reports += 1
 
     def __ensure_device(self) -> bool:
         if self.__noop:
