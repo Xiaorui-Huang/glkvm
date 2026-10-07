@@ -110,6 +110,30 @@ test("invalid durations do not start recording", () => {
 	assert.equal(context.kvmKeyboardCapture.status().active, false);
 });
 
+test("composition diagnostics retain empty codes without injecting keys or storing composed text", () => {
+	const {context, listeners} = prepare();
+	context.kvmKeyboardCapture.start();
+	const target = {tagName: "DIV", id: "stream-window", isContentEditable: false};
+	listeners.get("keydown")({type: "keydown", code: "", key: "Process", keyCode: 229,
+		charCode: 0, isComposing: true, target});
+	for (const type of ["compositionstart", "compositionupdate", "beforeinput", "input", "compositionend"]) {
+		listeners.get(type)({type, data: "private composed text", isComposing: true,
+			inputType: "insertCompositionText", target});
+	}
+	context.kvmKeyboardCapture.stop();
+	const exported = context.kvmKeyboardCapture.json();
+	const captured = JSON.parse(exported);
+	assert.equal(captured.version, 3);
+	assert.equal(captured.records[0].code, "");
+	assert.equal(captured.records[0].keyCode, 229);
+	assert.equal(captured.records[0].composing, true);
+	assert.deepEqual(captured.records[0].target, {tag: "DIV", id: "stream-window", editable: false});
+	assert.equal(captured.records[2].dataLength, "private composed text".length);
+	assert.equal(captured.records[3].inputType, "insertCompositionText");
+	assert.ok(!exported.includes("private composed text"));
+	assert.equal(listeners.size, 0);
+});
+
 test("updating an inactive recorder preserves its previous data", () => {
 	const {context, listeners} = prepare();
 	context.kvmKeyboardCapture.start();
@@ -120,6 +144,24 @@ test("updating an inactive recorder preserves its previous data", () => {
 	vm.runInContext(script, context);
 	assert.equal(JSON.parse(context.kvmKeyboardCapturePrevious.json()).records[0].code, "KeyZ");
 	assert.equal(context.kvmKeyboardCapture.status().active, false);
+});
+
+test("Unicode packet spaces are not rewritten into physical key events", () => {
+	const {context, listeners} = prepare();
+	context.kvmKeyboardCapture.start();
+	const input = [
+		{type: "keydown", code: "KeyY", key: "y", keyCode: 89, isComposing: false},
+		{type: "keydown", code: "", key: " ", keyCode: 231, isComposing: false},
+		{type: "keyup", code: "", key: " ", keyCode: 231, isComposing: false},
+		{type: "keyup", code: "Space", key: " ", keyCode: 32, isComposing: false},
+	];
+	for (const event of input) listeners.get(event.type)(event);
+	context.kvmKeyboardCapture.stop();
+	const records = JSON.parse(context.kvmKeyboardCapture.json()).records;
+	assert.deepEqual(records.map(entry => entry.code), ["KeyY", "", "", "Space"]);
+	assert.deepEqual(records.map(entry => entry.keyCode), [89, 231, 231, 32]);
+	assert.ok(records.every(entry => entry.composing === false));
+	assert.equal(records.length, input.length);
 });
 
 test("download exports the complete stopped log and revokes its temporary URL", () => {

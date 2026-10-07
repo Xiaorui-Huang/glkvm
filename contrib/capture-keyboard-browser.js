@@ -108,9 +108,21 @@
 
 	function keyEvent(event) {
 		record(event.type, {code: event.code, key: event.key, location: event.location,
+			keyCode: event.keyCode, charCode: event.charCode,
 			composing: event.isComposing, repeat: event.repeat, trusted: event.isTrusted,
 			shift: event.shiftKey, ctrl: event.ctrlKey, alt: event.altKey, meta: event.metaKey,
-			eventTime: event.timeStamp});
+			eventTime: event.timeStamp, target: eventTarget(event)});
+	}
+
+	function eventTarget(event) {
+		const target = event.target;
+		return target ? {tag: target.tagName, id: target.id, editable: target.isContentEditable} : null;
+	}
+
+	function inputEvent(event) {
+		record(event.type, {composing: event.isComposing, inputType: event.inputType,
+			dataLength: typeof event.data === "string" ? event.data.length : null,
+			eventTime: event.timeStamp, target: eventTarget(event)});
 	}
 
 	function focusEvent(event) {
@@ -125,6 +137,9 @@
 		root.clearTimeout(timer);
 		for (const type of ["keydown", "keyup"]) {
 			root.removeEventListener(type, keyEvent, true);
+		}
+		for (const type of ["compositionstart", "compositionupdate", "compositionend", "beforeinput", "input"]) {
+			root.removeEventListener(type, inputEvent, true);
 		}
 		for (const type of ["blur", "focus"]) {
 			root.removeEventListener(type, focusEvent, true);
@@ -163,6 +178,9 @@
 			for (const type of ["keydown", "keyup"]) {
 				root.addEventListener(type, keyEvent, true);
 			}
+			for (const type of ["compositionstart", "compositionupdate", "compositionend", "beforeinput", "input"]) {
+				root.addEventListener(type, inputEvent, true);
+			}
 			for (const type of ["blur", "focus"]) {
 				root.addEventListener(type, focusEvent, true);
 			}
@@ -177,7 +195,7 @@
 	}
 
 	function json() {
-		return JSON.stringify({version: 2, active, started, stopped, reason, durationSeconds,
+		return JSON.stringify({version: 3, active, started, stopped, reason, durationSeconds,
 			timeOrigin: root.performance.timeOrigin, records}, null, 2);
 	}
 
@@ -206,5 +224,5 @@
 	}
 
 	root.kvmKeyboardCapture = {start, stop, json, status, download};
-	root.console.info("Keyboard capture prepared, not recording. Start with kvmKeyboardCapture.start().");
+	root.console.info("Keyboard capture v3 prepared, not recording. Start with kvmKeyboardCapture.start().");
 })(globalThis);

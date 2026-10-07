@@ -209,6 +209,8 @@ Run the updated [browser snippet](capture-keyboard-browser.js) in DevTools in th
 existing live KVM tab, without reloading or opening another KVM session. Updating
 an inactive recorder retains its previous API and data as
 `kvmKeyboardCapturePrevious`; updating an active recorder is rejected.
+The prepared message and exported JSON must both identify version 3. Selecting
+the updated file in the editor does not update the recorder already in the tab.
 
 After the manager confirms the KVM trace is attached, start browser recording:
 
@@ -218,7 +220,9 @@ kvmKeyboardCapture.start();
 
 The browser defaults to five minutes and 50,000 records. An optional integer
 argument sets a duration from one to 600 seconds. Key events retain order,
-timestamps, modifiers, repeat flags, and key values. `status()` reports counts
+timestamps, modifiers, repeat flags, key values, legacy key codes, and target
+element metadata. Composition and input events retain flags and data length,
+not composed text. `status()` reports counts
 and whether any WebRTC sends were observed. A lack of send records is not proof
 that the frontend failed to send; cached send methods, workers, or other browser
 realms can escape the hooks.
@@ -261,6 +265,23 @@ capture began with no held keys. USB writes still do not establish receipt by
 Windows or the final text after application editing, layout mapping, or IME
 processing. Preserve the target result as well; a target-side event capture may
 be needed if both comparisons match despite a visible failure.
+
+### Unicode Packet Input
+
+An empty browser `code` with `keyCode: 231` is Windows `VK_PACKET`, used to
+deliver Unicode characters rather than a physical scan-code key event. It is
+not the IME process key (`229`). Check the `key`, composition flags, and nearby
+press/release pairs instead of assuming transport loss or an IME failure.
+
+PowerToys Quick Accent is one possible upstream source: it intercepts a held
+letter followed by its activation key, which can include Space, then inserts
+text. Ordinary overlapping typing can trigger this path. A paired failure
+capture showed packet Space events, missing browser releases, and matching
+worker-to-USB reports, with Quick Accent running and no excluded apps. This
+makes Quick Accent a candidate, not a confirmed cause until an A/B test passes.
+Temporarily disable only that utility, with permission, and repeat the same
+free-form capture without changing the KVM or other input settings. Do not
+compensate by timing out held keys or releasing them on every Space press.
 
 ## Remaining Work
 
