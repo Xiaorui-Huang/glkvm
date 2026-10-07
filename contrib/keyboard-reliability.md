@@ -196,6 +196,72 @@ keys, and Backspace. Stop on unpredictable input and use the physical keyboard
 as needed. After testing, restore the original software even if typing succeeds,
 then verify web access, video, and keyboard behavior before retaining the patch.
 
+## Free-Form Diagnostic Capture
+
+The capture does not require prescribed text, key order, or typing speed. Type
+naturally in the existing KVM tab and reproduce the actual failure, including
+overlaps, modifiers, holds, corrections, and navigation keys. Use a disposable
+target document. Logs include physical key codes and literal browser key values;
+do not type passwords or other secrets while either recorder is active. Keep
+captured JSON, trace files, and analysis output private and outside Git.
+
+Run the updated [browser snippet](capture-keyboard-browser.js) in DevTools in the
+existing live KVM tab, without reloading or opening another KVM session. Updating
+an inactive recorder retains its previous API and data as
+`kvmKeyboardCapturePrevious`; updating an active recorder is rejected.
+
+After the manager confirms the KVM trace is attached, start browser recording:
+
+```javascript
+kvmKeyboardCapture.start();
+```
+
+The browser defaults to five minutes and 50,000 records. An optional integer
+argument sets a duration from one to 600 seconds. Key events retain order,
+timestamps, modifiers, repeat flags, and key values. `status()` reports counts
+and whether any WebRTC sends were observed. A lack of send records is not proof
+that the frontend failed to send; cached send methods, workers, or other browser
+realms can escape the hooks.
+
+When the fault occurs, stop and export the browser log:
+
+```javascript
+kvmKeyboardCapture.stop();
+kvmKeyboardCapture.download();
+```
+
+The [KVM recorder](capture_keyboard_trial.py) defaults to six minutes, providing
+setup margin around the browser session. Its `start --seconds 360` command
+discovers the keyboard worker and stores a descriptor-filtered `strace` in a
+private trial subdirectory. `stop --directory <capture-directory>` signals only
+the trace supervisor, which detaches the tracer without releasing keys or
+restarting KVMD. Recording remains bounded even if the SSH connection closes.
+Neither recorder changes normal key-hold or repeat behavior.
+
+The manager can compare arbitrary captured input offline:
+
+```text
+python contrib/analyze_keyboard_capture.py --browser <browser.json> --trace <trace.txt> --metadata <metadata.json>
+```
+
+[The analyzer](analyze_keyboard_capture.py) uses the repository CSV key map and
+decodes queue pickle opcodes without importing or executing pickle payloads. It
+compares browser discrete transitions with worker events, then reconstructs
+ordered USB state reports from those worker events. The JSON result identifies
+missing, extra, or reordered transitions, failed writes, report mismatches, hold
+duration, overlap, and matched event-to-write timing. Browser auto-repeat
+keydowns are not counted as new discrete presses. Recorded clear/reset events
+and unsupported browser codes are surfaced separately.
+
+Clock alignment is estimated from matching transitions and includes clock skew
+and transport delay; it is not a one-way latency measurement. Events outside
+the shared recording window are excluded and reported, not labeled dropped.
+Incomplete parsing is explicitly flagged, and reconstruction assumes the KVM
+capture began with no held keys. USB writes still do not establish receipt by
+Windows or the final text after application editing, layout mapping, or IME
+processing. Preserve the target result as well; a target-side event capture may
+be needed if both comparisons match despite a visible failure.
+
 ## Remaining Work
 
 - Confirm the active frontend/Native WebRTC relay path and correlate LAN failures
